@@ -35,6 +35,14 @@ class Context:
     block_tables: torch.Tensor | None = None
 
 # 模块级全局变量，同一进程内所有层共享
+# 变量名以下划线开头：约定为"模块内部使用"，外部应通过get_context/set_context访问
+#
+#   ModelRunner.run()
+#     │ set_context(...)  ─────────> _CONTEXT = Context(本次前向的元数据)
+#     │ model(input_ids, positions)
+#     │   └─ 每一层 Attention.forward ──> get_context() 读取 slot_mapping、cu_seqlens 等
+#     │   └─ ParallelLMHead.forward   ──> get_context() 读取 is_prefill、cu_seqlens_q
+#     │ reset_context()   ─────────> _CONTEXT = Context()（清空）
 _CONTEXT = Context()
 
 def get_context():
@@ -42,6 +50,8 @@ def get_context():
 
 # 每次前向之前由ModelRunner设置
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None):
+    # global：声明要修改的是模块级的_CONTEXT
+    # 如果不写，函数里的 _CONTEXT = ... 会创建一个同名的局部变量，模块级的_CONTEXT不会变
     global _CONTEXT
     _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables)
 

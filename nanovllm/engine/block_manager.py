@@ -35,6 +35,37 @@ class Block:
 
 # 负责KV block的分配、回收以及前缀缓存（prefix caching）
 # 前缀缓存：多个请求有相同前缀时（如相同的system prompt），直接复用已经算好的KV，跳过这部分prefill计算
+#
+# 逻辑block与物理block（类比操作系统的虚拟内存分页，block_size=256）：
+#
+#   序列A  token   0~255  ─> 逻辑block0 ─> 物理block 7  <──┐
+#          token 256~511  ─> 逻辑block1 ─> 物理block 3     │ 同一个物理block，ref_count=2
+#          token 512~600  ─> 逻辑block2 ─> 物理block 12    │
+#   序列B  token   0~255  ─> 逻辑block0 ─> 物理block 7  <──┘
+#          token 256~300  ─> 逻辑block1 ─> 物理block 5
+#
+#   A.block_table = [7, 3, 12]      B.block_table = [7, 5]
+#   物理block编号不需要连续，也不需要按顺序，空闲队列里取到哪个就用哪个
+#   A和B前256个token完全相同（比如相同的system prompt），所以共享物理block 7，B不用再算一遍这部分KV
+#
+# 一个物理block的生命周期：
+#
+#     ┌────────────────────┐
+#     │ (1) 空闲，无内容   │ <──────────────────────────────────────────────────┐
+#     └────────────────────┘                                                    │
+#               │ _allocate_block（新序列需要新block）                          │
+#               ▼                                                               │
+#     ┌────────────────────┐                                                    │
+#     │ (2) 使用中，未填满 │ ref_count减到0 ──> 回到 (1)                        │
+#     │    hash = -1       │                                                    │
+#     └────────────────────┘                                                    │
+#               │ hash_blocks（block被写满，计算hash并登记）                    │
+#               ▼                                                               │
+#     ┌────────────────────┐  ref_count减到0   ┌─────────────────────────┐      │
+#     │ (3) 使用中，已填满 │ ────────────────> │ (4) 空闲，但内容仍有效  │ ─────┘
+#     │   可被其他序列共享 │ <───────────────  │   hash仍在登记表中      │ 被当作新block分配出去，
+#     └────────────────────┘ allocate命中缓存  └─────────────────────────┘ 删除hash登记，回到 (1)
+#                            （从free队列捞回）
 class BlockManager:
 
     # num_blocks：物理block总数（ModelRunner根据剩余显存算出的num_kvcache_blocks）
@@ -43,6 +74,7 @@ class BlockManager:
         # 每个block容纳的token数
         self.block_size = block_size
         # 所有物理block的元信息，下标即block_id
+        # self.blocks: list[Block] 是带类型注解的赋值，注解只是给人和IDE看的提示
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         # hash -> 物理block id，用于查找可复用的block（前缀缓存的索引）
         # 注意：block被释放（ref_count=0）后，这里的映射不会立即删除，
@@ -50,6 +82,9 @@ class BlockManager:
         self.hash_to_block_id: dict[int, int] = dict()
         # 空闲block队列，从左侧取、从右侧还，近似LRU：
         # 最近释放的block排在最后才会被覆盖，保留其缓存内容的时间最长
+        # deque（双端队列）：两端插入/删除都是O(1)；普通list的 pop(0) 需要移动所有元素，是O(n)
+        #   popleft() 从左边取出，append() 从右边放入
+        # deque(range(3)) -> deque([0, 1, 2])
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         # 正在被使用（ref_count > 0）的block集合，用set是为了O(1)判断某个block是否在用
         # 不变量：free_block_ids 与 used_block_ids 互不相交，并集为全部block
@@ -61,13 +96,24 @@ class BlockManager:
     # 例如：
     #   序列A：[sys prompt][问题1]   序列B：[sys prompt][问题2]
     #   第0个block的hash相同 -> 可复用；第1个block的hash不同 -> 需要重新计算
+    #
+    #   block0的hash: h0 = hash(          block0的token)
+    #   block1的hash: h1 = hash(h0     +  block1的token)
+    #   block2的hash: h2 = hash(h1     +  block2的token)
+    #   h2 隐含了 block0、block1、block2 全部的token信息
+    #
     # xxhash：非加密hash，速度非常快
+    # @classmethod：类方法，第一个参数是类本身（cls）而不是实例（self），可以通过 BlockManager.compute_hash(...) 直接调用
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+        # 创建一个64位hash计算器，可以多次update喂入数据，最后取结果
         h = xxhash.xxh64()
         if prefix != -1:
+            # int.to_bytes(8, "little")：把整数转成8字节的二进制（小端序），hash只能处理字节
             h.update(prefix.to_bytes(8, "little"))
+        # list[int] -> numpy数组 -> 原始字节（每个int64占8字节，256个token即2048字节）
         h.update(np.array(token_ids).tobytes())
+        # 以整数形式返回hash值
         return h.intdigest()
 
     # 从空闲队列取一个block分配出去（不复用其中的内容）
@@ -77,6 +123,7 @@ class BlockManager:
         assert block.ref_count == 0
         # 这个block即将被覆盖，原有内容失效，需要把它从hash表中删掉
         # 额外判断hash_to_block_id[hash] == block_id：同一个hash可能已被更新为指向其他block，那种情况下不能误删
+        # dict.get(key)：key不存在时返回None而不是报错（dict[key] 在key不存在时会抛KeyError）
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
         block.reset()
@@ -105,6 +152,7 @@ class BlockManager:
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
+            # dict.get(key, default)：key不存在时返回default，这里不存在返回-1
             block_id = self.hash_to_block_id.get(h, -1)
             # 未命中，或者hash碰撞（内容不一致），后面的block也不可能命中了（链式hash），直接退出
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
@@ -112,6 +160,7 @@ class BlockManager:
             num_cached_blocks += 1
             # 命中的block如果正被其他序列使用，直接共享，不需要占用新的空闲block
             # 如果命中的block在空闲队列中（已被释放但内容还在），则需要把它从空闲队列"拿回来"，依然消耗一个空闲block名额
+            # x in set：判断元素是否在集合中，O(1)；同样的操作对list是O(n)
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
         if len(self.free_block_ids) < num_new_blocks:
@@ -120,6 +169,15 @@ class BlockManager:
 
     # 为序列分配block，前num_cached_blocks个复用缓存，其余分配新的
     # 必须在can_allocate返回>=0之后调用
+    #
+    # 完整示例（block_size=4，方便演示）：
+    #   之前序列X算过 [1,2,3,4 | 5,6,7,8 | 9]，已登记 hash(1234)->block 7，hash(5678)->block 3
+    #   新序列Y = [1,2,3,4 | 5,6,7,8 | 0,0,0]，num_blocks=3
+    #   can_allocate：检查前2个block，都命中 -> num_cached_blocks=2
+    #   allocate：
+    #     block_table = [7, 3]          （复用，ref_count+1）
+    #     block_table = [7, 3, 新block]  （第3个block新分配）
+    #     num_cached_tokens = 2 * 4 = 8  -> prefill只需计算最后3个token
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
         h = -1
@@ -149,6 +207,7 @@ class BlockManager:
     # 逆序释放：靠后的block先进入空闲队列，先被覆盖；
     # 靠前的block（公共前缀，复用价值更高）后进入空闲队列，在缓存中保留得更久
     def deallocate(self, seq: Sequence):
+        # reversed(list)：从后往前遍历，不修改原列表
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
             block.ref_count -= 1
@@ -162,7 +221,14 @@ class BlockManager:
     # 本次decode的输入是last_token，位置为len(seq)-1
     # 当len(seq) % block_size == 1时，说明last_token是新block的第一个token，需要一个新的空闲block
     # 例如：block_size=256，len(seq)=257，第257个token（位置256）要写到第2个block
+    #
+    #   len(seq)   last_token位置   位置所在block   是否需要新block（block_size=256）
+    #     256          255             第0个          否（第0个block已存在）
+    #     257          256             第1个          是（len % 256 == 1）
+    #     258          257             第1个          否（上一步已分配）
+    #
     # 这里利用了 True == 1、False == 0：需要新block时要求空闲数>=1，否则>=0（恒成立）
+    # %：取余，257 % 256 = 1
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 

@@ -22,6 +22,56 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 #   V  ：vocab_size
 #   tp ：张量并行数
 # 以Qwen3-0.6B为例（tp=1）：H=1024，Hq=16，Hkv=8，D=128，I=3072，V=151936，28层
+#
+# 整个模型的结构与shape变化（Qwen3-0.6B，N个token）：
+#
+#   input_ids [N]
+#       │ embed_tokens（查表）
+#       ▼
+#   x [N, 1024]
+#       │
+#   ════╪═══════ 以下为一个 Qwen3DecoderLayer，重复28次 ═══════
+#       │
+#       ├──────────────────────────────────┐ 保存一份作为残差 r
+#       ▼                                  │
+#   input_layernorm（RMSNorm）             │
+#       ▼                                  │
+#   Qwen3Attention：                       │
+#     qkv_proj  [N, 1024] -> [N, 4096]     │
+#     split     -> q [N, 2048]             │
+#                  k [N, 1024]             │
+#                  v [N, 1024]             │
+#     view      -> q [N, 16, 128]          │
+#                  k [N, 8, 128]           │
+#                  v [N, 8, 128]           │
+#     q_norm、k_norm（形状不变）           │
+#     rotary_emb（形状不变）               │
+#     attn      -> o [N, 16, 128]          │
+#     flatten   -> [N, 2048]               │
+#     o_proj    -> [N, 1024]               │
+#       ▼                                  │
+#      (+) <───────────────────────────────┘ x = 注意力输出 + r
+#       │
+#       ├──────────────────────────────────┐ 保存一份作为残差 r
+#       ▼                                  │
+#   post_attention_layernorm               │
+#       ▼                                  │
+#   Qwen3MLP：                             │
+#     gate_up_proj [N, 1024] -> [N, 6144]  │
+#     SiluAndMul   -> [N, 3072]            │
+#     down_proj    -> [N, 1024]            │
+#       ▼                                  │
+#      (+) <───────────────────────────────┘ x = MLP输出 + r
+#       │                                    （代码中这一步推迟到下一层的
+#       │                                      input_layernorm里与归一化一起做）
+#   ════╪═══════════════════════════════════════════════════
+#       ▼
+#   norm（最终RMSNorm）
+#       ▼
+#   hidden [N, 1024]
+#       │ lm_head（prefill时只取每条序列最后一个token）
+#       ▼
+#   logits [B, 151936]
 
 
 # Qwen3的自注意力模块：QKV投影 -> QK-Norm -> RoPE -> 注意力 -> 输出投影
@@ -118,8 +168,14 @@ class Qwen3Attention(nn.Module):
         # [N, H] -> [N, (Hq + 2*Hkv) * D]
         qkv = self.qkv_proj(hidden_states)
         # 沿最后一维切分：q [N, Hq*D]，k [N, Hkv*D]，v [N, Hkv*D]（都是qkv的视图，不拷贝）
+        # tensor.split([a, b, c], dim)：沿dim维按指定长度切成多段（chunk是平均切，split可以不等长）
+        #   例如 [N, 4096].split([2048, 1024, 1024], -1) -> [N, 2048]、[N, 1024]、[N, 1024]
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # 拆成多头
+        # tensor.view(新形状)：不改变数据，只改变"怎么解读"这些数据，元素总数必须不变
+        #   -1 表示"这一维自动推算"：[N, 2048].view(-1, 16, 128) -> 2048 = 16*128，所以-1 = N
+        #   例如一个token的q有2048个数，看作16个头、每头128个数
+        #   [q0 q1 ... q127 | q128 ... q255 | ... ]  ->  头0: q0~q127，头1: q128~q255，...
         q = q.view(-1, self.num_heads, self.head_dim)     # [N, Hq, D]
         k = k.view(-1, self.num_kv_heads, self.head_dim)  # [N, Hkv, D]
         v = v.view(-1, self.num_kv_heads, self.head_dim)  # [N, Hkv, D]
@@ -132,6 +188,9 @@ class Qwen3Attention(nn.Module):
         # 注意力：o [N, Hq, D]（decode时为[B, 1, Hq, D]，N=B）
         o = self.attn(q, k, v)
         # 合并多头：flatten(1, -1) -> [N, Hq*D]；o_proj -> [N, H]
+        # tensor.flatten(start, end)：把第start到第end维合并成一维，是view拆头的逆操作
+        #   [N, 16, 128].flatten(1, -1) -> [N, 2048]
+        #   decode时o为[B, 1, 16, 128]，flatten(1, -1) -> [B, 1*16*128] = [B, 2048]，结果一致
         output = self.o_proj(o.flatten(1, -1))
         return output
 
@@ -193,6 +252,7 @@ class Qwen3DecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
+            # getattr(对象, "名字", 默认值)：取属性，不存在时返回默认值（不同版本/模型的config字段可能不全）
             qkv_bias=getattr(config, 'attention_bias', True),
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
@@ -243,6 +303,8 @@ class Qwen3Model(nn.Module):
         # 词嵌入：[N] -> [N, H]，本地权重[V/tp, H]
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         # num_hidden_layers个解码层
+        # nn.ModuleList：存放子模块的列表；必须用它而不是普通list，否则子模块的参数不会被登记
+        # 参数名会带上下标，如 "model.layers.0.self_attn.qkv_proj.weight"，与HF权重名一致
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         # 最终归一化，weight: [H]
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -288,6 +350,7 @@ class Qwen3ForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         # 词嵌入与输出层共享权重（小模型常用，如Qwen3-0.6B），可节省一个 V×H 的矩阵
         # 共享时checkpoint里没有lm_head.weight，加载embed_tokens.weight后lm_head自动可用
+        # .data = 另一个张量的.data：让两个参数指向同一块显存，修改一个另一个也变
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 

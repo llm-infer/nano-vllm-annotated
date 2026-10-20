@@ -10,10 +10,35 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
+# 张量并行（Tensor Parallelism）是什么？
+#   模型太大或想更快时，把每一层的权重矩阵切成几份，分到多张GPU上，每张卡只算一部分，再合并结果
+#
+# 以 tp=2、MLP（H -> I -> H）为例，"列并行 + 行并行"的配对：
+#
+#             GPU 0                                   GPU 1
+#   x [N, H]（两张卡都有完整的x）              x [N, H]
+#      │                                        │
+#      ▼ 列并行：W1的上半部分 [I/2, H]            ▼ 列并行：W1的下半部分 [I/2, H]
+#   h0 [N, I/2]                               h1 [N, I/2]        <- 各自算出中间结果的一半，不需要通信
+#      │                                        │
+#      ▼ 行并行：W2的左半部分 [H, I/2]            ▼ 行并行：W2的右半部分 [H, I/2]
+#   y0 [N, H]（部分和）                        y1 [N, H]（部分和）
+#      │                                        │
+#      └──────────── all_reduce：y = y0 + y1 ────┘                <- 只在这里通信一次
+#      ▼                                        ▼
+#   y [N, H]（两张卡都得到完整结果）            y [N, H]
+#
+# 为什么行并行的部分和相加等于完整结果？矩阵乘法按分块展开：
+#   y = h @ W2^T = [h0, h1] @ [W2左, W2右]^T = h0 @ W2左^T + h1 @ W2右^T = y0 + y1
+#
 # 线性层基类，支持张量并行（Megatron-LM风格）
 # 权重形状为[output_size, input_size]，与nn.Linear一致，计算 y = x @ W^T + b
 #   x: [N, input_size] -> y: [N, output_size]，N为token数
 # tp_dim：权重沿哪个维度切分，0为按输出维切（列并行），1为按输入维切（行并行），None为不切
+# nn.Module：PyTorch中所有网络层/模型的基类
+#   继承它之后，在__init__中赋值的 nn.Parameter 和子 nn.Module 会被自动登记，
+#   model.parameters()、model.modules()、model.get_parameter(名字) 等都依赖这个登记
+#   调用 layer(x) 时会自动执行 layer.forward(x)
 class LinearBase(nn.Module):
 
     def __init__(
@@ -23,6 +48,7 @@ class LinearBase(nn.Module):
         bias: bool = False,
         tp_dim: int | None = None,
     ):
+        # super().__init__()：调用父类（nn.Module）的初始化，必须在给self赋值参数之前调用
         super().__init__()
         # 权重切分的维度
         self.tp_dim = tp_dim
@@ -32,8 +58,12 @@ class LinearBase(nn.Module):
         self.tp_size = dist.get_world_size()
         # 这里的input_size/output_size已经是切分后的本地大小
         # weight: [output_size, input_size]
+        # torch.empty：分配显存但不初始化（值是随机的垃圾数据），因为马上会从checkpoint加载覆盖
+        # nn.Parameter：把张量标记为"模型参数"，会被Module自动登记，名字就是属性名（如 "weight"）
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         # 挂上子类实现的weight_loader，load_model时调用它从完整权重中切出本rank的部分
+        # Python对象可以随时添加新属性，这里给参数对象动态加了一个weight_loader属性
+        # self.weight_loader 是"绑定方法"，调用时自动带上self，所以loader只需传 (param, loaded_weight)
         self.weight.weight_loader = self.weight_loader
         if bias:
             # bias: [output_size]
@@ -43,6 +73,7 @@ class LinearBase(nn.Module):
             # 注册为None，保证self.bias属性存在
             self.register_parameter("bias", None)
 
+    # 基类不实现forward，子类必须重写；直接调用会抛出NotImplementedError
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
@@ -63,6 +94,8 @@ class ReplicatedLinear(LinearBase):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param.data.copy_(loaded_weight)
 
+    # F.linear(x, W, b) = x @ W^T + b
+    #   x [N, in] @ W^T [in, out] -> [N, out]，b为None时不加bias
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
 
@@ -87,6 +120,9 @@ class ColumnParallelLinear(LinearBase):
 
     # 沿第0维（输出维）切出第tp_rank份
     # loaded_weight: [output_size, input_size] -> narrow -> [output_size/tp, input_size]
+    # tensor.narrow(dim, start, length)：在第dim维上取 [start, start+length) 这一段，返回视图（不拷贝）
+    #   例如 W 形状[4096, 1024]，tp=2，rank=1：W.narrow(0, 2048, 2048) 即 W[2048:4096, :]
+    # param.data.copy_(src)：把src的数据原地拷贝进参数（形状必须一致）；.data 绕过参数的梯度追踪
     # （bias同理：[output_size] -> [output_size/tp]）
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -127,6 +163,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         # 本地权重中该子层对应的区域：[I/tp, H]
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         # 完整子层权重 [I, H] 沿输出维切成tp份，取本rank那份：[I/tp, H]
+        # tensor.chunk(n, dim)：沿dim维平均切成n块，返回元组；[self.tp_rank] 取第rank块
+        #   例如 [3072, 1024].chunk(2, 0) -> ([1536, 1024], [1536, 1024])
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
 
@@ -136,6 +174,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 #   本地权重：[(Hq + 2*Hkv) * D, H]，布局为 [本rank的q头 (Hq*D行); k头 (Hkv*D行); v头 (Hkv*D行)]
 #   x: [N, H] -> y: [N, (Hq + 2*Hkv) * D]
 # 例如Qwen3-0.6B（16个q头，8个kv头，D=128，tp=1）：权重[(16+16)*128, 1024] = [4096, 1024]
+#
+# tp=2时，HF权重如何分配到各rank（Qwen3-0.6B：16个q头，8个kv头）：
+#
+#   HF checkpoint中的权重        切成2份          rank 0 本地qkv_proj.weight    rank 1 本地qkv_proj.weight
+#   q_proj [16*128, H]   ──>  q头0~7 | q头8~15  ──>   第一段：q头 0~7              第一段：q头 8~15
+#   k_proj [ 8*128, H]   ──>  k头0~3 | k头4~7   ──>   第二段：k头 0~3              第二段：k头 4~7
+#   v_proj [ 8*128, H]   ──>  v头0~3 | v头4~7   ──>   第三段：v头 0~3              第三段：v头 4~7
+#                                                    形状 [(8+4+4)*128, H]        形状 [(8+4+4)*128, H]
+#   每个rank拿到"自己那几个头"的q、k、v，注意力可以在本卡上独立计算，不需要通信
 # GQA时kv头数少于q头数，所以q和k/v的分片大小不同
 class QKVParallelLinear(ColumnParallelLinear):
 
@@ -216,5 +263,9 @@ class RowParallelLinear(LinearBase):
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             # 各rank的部分和逐元素相加，结果原地写回y，所有rank得到相同的完整输出
+            # all_reduce：集合通信，所有rank都必须调用，否则会一直等待（卡死）
+            #   rank0: y0 ─┐
+            #              ├─ 求和 ─> 每个rank的y都变成 y0 + y1
+            #   rank1: y1 ─┘
             dist.all_reduce(y)
         return y
