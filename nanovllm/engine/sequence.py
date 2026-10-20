@@ -17,6 +17,14 @@ class SequenceStatus(Enum):
 
 
 # 一条请求在引擎内部的表示：保存token、状态、KV block映射以及采样参数
+# 各计数字段的变化示例（block_size=256，prompt长600，前缀缓存命中1个block，max_num_batched_tokens=200）：
+#   初始化：              num_tokens=600  num_prompt_tokens=600  num_cached_tokens=0    block_table=[]
+#   第1次调度（allocate）：num_cached_tokens=256（命中1个block） block_table=[5, 9, 12]
+#                         num_scheduled_tokens=200（预算只有200，chunked prefill）
+#   第1次postprocess：    num_cached_tokens=456  num_scheduled_tokens=0，采样结果丢弃
+#   第2次调度：           num_scheduled_tokens=144（剩余600-456），状态变为RUNNING
+#   第2次postprocess：    num_cached_tokens=600，追加第1个生成token -> num_tokens=601
+#   之后每次decode：      num_scheduled_tokens=1，postprocess后num_cached_tokens+1、num_tokens+1
 class Sequence:
     # 类变量，所有实例共享；LLMEngine初始化时会用config.kvcache_block_size覆盖
     block_size = 256
@@ -27,11 +35,14 @@ class Sequence:
     # 注意：默认参数SamplingParams()只在函数定义时创建一次，所有未传参的调用共享同一个对象
     # 这里只读取它的字段、不会修改，所以没有问题
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+        # 序列唯一编号，从0开始自增，也代表提交顺序
         self.seq_id = next(Sequence.counter)
+        # 当前生命周期状态，新序列为WAITING
         self.status = SequenceStatus.WAITING
+        # 全部token id：prompt + 已生成的token，生成过程中不断append
         # 浅拷贝，后续append_token不会影响调用方传进来的list
         self.token_ids = copy(token_ids)
-        # 最后一个token，decode时作为模型输入
+        # 最后一个token，decode时作为模型输入（只需输入它，前面的token都已在KV cache中）
         self.last_token = token_ids[-1]
         # 当前总token数（prompt + 已生成）
         self.num_tokens = len(self.token_ids)
@@ -48,10 +59,15 @@ class Sequence:
         self.is_prefill = True
         # 逻辑block -> 物理block的映射表，block_table[i]是第i个逻辑block对应的物理block id
         # 类似操作系统的页表，物理block在显存中不必连续
+        # 例如：block_table=[5, 9, 12]，表示第0~255个token的KV在物理block 5，第256~511个在block 9，以此类推
+        # 第j个token的KV所在槽位 slot = block_table[j // block_size] * block_size + j % block_size
         self.block_table = []
         # 采样参数直接拷贝到序列上，便于ModelRunner批量读取
+        # 采样温度，见SamplingParams.temperature
         self.temperature = sampling_params.temperature
+        # 最多生成多少个token（不含prompt），达到后序列结束
         self.max_tokens = sampling_params.max_tokens
+        # 是否忽略EOS继续生成
         self.ignore_eos = sampling_params.ignore_eos
 
     # 支持len(seq)，返回总token数

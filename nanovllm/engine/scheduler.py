@@ -14,9 +14,13 @@ from nanovllm.engine.block_manager import BlockManager
 class Scheduler:
 
     def __init__(self, config: Config):
+        # 单个step最多调度的序列数（prefill和decode都受限）
         self.max_num_seqs = config.max_num_seqs
+        # 单个step最多计算的token数（主要约束prefill；decode每条序列1个token）
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        # 结束符token id，由tokenizer提供
         self.eos = config.eos
+        # 每个KV block容纳的token数
         self.block_size = config.kvcache_block_size
         # num_kvcache_blocks在ModelRunner初始化时根据剩余显存计算得出
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -32,6 +36,11 @@ class Scheduler:
         self.waiting.append(seq)
 
     # 返回：(本次调度的序列列表, 是否为prefill)
+    # 每条被调度序列的num_scheduled_tokens会被设置为本step要计算的token数
+    # 例如（max_num_batched_tokens=1000，waiting中有A(800个token)、B(500个token)，均无缓存）：
+    #   A：remaining=1000 >= 800，调度800个，A全部算完，移入running
+    #   B：remaining=200 < 500，且scheduled_seqs非空，不允许切块，break
+    #   本step只做A；下个step B成为队头，可以被切块
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
         num_batched_tokens = 0

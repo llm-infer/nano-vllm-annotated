@@ -24,7 +24,9 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         # 同步block大小到Sequence的类变量，用于计算num_blocks等
         Sequence.block_size = config.kvcache_block_size
+        # 子进程列表（rank 1~N-1），退出时join
         self.ps = []
+        # 与子进程一一对应的Event，rank 0用它通知子进程"共享内存里有新指令"
         self.events = []
         # 张量并行：rank 0运行在当前主进程，rank 1~N-1各起一个子进程
         # 必须用spawn而不是fork：CUDA在fork出来的子进程中无法重新初始化
@@ -39,6 +41,7 @@ class LLMEngine:
             self.events.append(event)
         # rank 0持有所有子进程的Event列表
         self.model_runner = ModelRunner(config, 0, self.events)
+        # 分词器：文本 <-> token id；use_fast=True使用Rust实现的fast tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         # 必须在ModelRunner之后创建：config.num_kvcache_blocks在ModelRunner.allocate_kv_cache中才确定
@@ -76,6 +79,9 @@ class LLMEngine:
         return self.scheduler.is_finished()
 
     # 离线批量生成接口：一次性提交全部请求，循环step直到全部完成
+    # prompts：文本列表或token id列表
+    # sampling_params：单个（所有请求共用）或与prompts等长的列表
+    # 返回：与prompts顺序一致的列表，每个元素为 {"text": 生成文本, "token_ids": 生成的token id列表}
     def generate(
         self,
         prompts: list[str] | list[list[int]],
@@ -88,7 +94,9 @@ class LLMEngine:
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
+        # seq_id -> 生成的token id列表
         outputs = {}
+        # 最近一次prefill/decode step的吞吐（tok/s），用于进度条显示
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()

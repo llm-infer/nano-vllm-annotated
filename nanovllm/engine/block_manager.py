@@ -37,17 +37,22 @@ class Block:
 # 前缀缓存：多个请求有相同前缀时（如相同的system prompt），直接复用已经算好的KV，跳过这部分prefill计算
 class BlockManager:
 
+    # num_blocks：物理block总数（ModelRunner根据剩余显存算出的num_kvcache_blocks）
+    # block_size：每个block容纳的token数
     def __init__(self, num_blocks: int, block_size: int):
+        # 每个block容纳的token数
         self.block_size = block_size
+        # 所有物理block的元信息，下标即block_id
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        # hash -> 物理block id，用于查找可复用的block
+        # hash -> 物理block id，用于查找可复用的block（前缀缓存的索引）
         # 注意：block被释放（ref_count=0）后，这里的映射不会立即删除，
         # 只要block还没被重新分配出去，里面的KV就仍然有效，后续请求依然可以命中
         self.hash_to_block_id: dict[int, int] = dict()
         # 空闲block队列，从左侧取、从右侧还，近似LRU：
         # 最近释放的block排在最后才会被覆盖，保留其缓存内容的时间最长
         self.free_block_ids: deque[int] = deque(range(num_blocks))
-        # 正在被使用（ref_count > 0）的block集合
+        # 正在被使用（ref_count > 0）的block集合，用set是为了O(1)判断某个block是否在用
+        # 不变量：free_block_ids 与 used_block_ids 互不相交，并集为全部block
         self.used_block_ids: set[int] = set()
 
     # 计算一个block的hash，把前一个block的hash作为前缀一起计算（链式hash）
@@ -87,6 +92,9 @@ class BlockManager:
 
     # 判断能否为一条新序列（prefill）分配所需的block
     # 返回值：-1 表示空闲block不足；>=0 表示可以分配，且前缀缓存命中了多少个block
+    # 例如：序列需要4个block，前2个命中缓存，其中1个正被其他序列使用、1个在空闲队列中
+    #   num_cached_blocks=2，num_new_blocks=4-1=3（在用的那个直接共享，不消耗空闲block）
+    #   空闲block >= 3 时返回2，否则返回-1
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
         num_cached_blocks = 0
