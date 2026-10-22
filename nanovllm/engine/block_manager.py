@@ -5,12 +5,146 @@ import numpy as np
 from nanovllm.engine.sequence import Sequence
 
 
+#====================================================================================================
+# 全局视角：BlockManager、block_table、CPU、显存、ModelRunner.kv_cache 之间的关系
+#====================================================================================================
+#
+# 一句话总结：
+#   BlockManager 在 CPU 上"记账"（哪个block空闲、哪个被谁用、内容的hash），只处理整数编号，从不碰显存；
+#   ModelRunner.kv_cache 是 GPU 上一整块预先分配好的显存，真正存放K/V数据；
+#   两者之间唯一的纽带是"物理block编号"：block编号 = kv_cache 第2维（NB维）的下标。
+#
+# 一、整体结构（以 tensor_parallel_size=1 为例）
+#
+#   ┌────────────────────────── CPU 内存（rank 0 主进程，普通 Python 对象） ───────────────────────────┐
+#   │ Scheduler                                                                                        │
+#   │   └─ BlockManager（只记账，不碰显存）                                                            │
+#   │        blocks[i]         Block(block_id=i, ref_count, hash, token_ids)  每个物理block的元信息    │
+#   │        free_block_ids    deque([2, 5, 8, ...])   空闲的block编号                                 │
+#   │        used_block_ids    {3, 7, ...}             正在使用的block编号                             │
+#   │        hash_to_block_id  {hash: block_id}        前缀缓存索引                                    │
+#   │                                                                                                  │
+#   │ Sequence（每条请求一个）                                                                         │
+#   │   token_ids   = [t0, t1, ..., t299]      token本身只存在CPU上                                    │
+#   │   block_table = [7, 3]                   第0个逻辑block在物理block 7，第1个在物理block 3         │
+#   └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+#                    │ BlockManager.allocate / may_append 往 block_table 里填block编号
+#                    │
+#                    │ ModelRunner.prepare_prefill / prepare_decode：把 block_table 翻译成张量
+#                    │   slot_mapping  [N]     每个新token写到哪个槽位（slot = block编号 × block_size + 块内偏移）
+#                    │   block_tables  [B, M]  每条序列的block编号表，读KV时用
+#                    │   用 pin_memory + .cuda(non_blocking=True) 从CPU拷贝到GPU（只拷几KB的整数）
+#                    ▼
+#   ┌───────────────────────────────── GPU 显存（每个 rank 各有一份） ─────────────────────────────────┐
+#   │ ModelRunner.kv_cache  形状 [2, L, NB, BS, Hkv, D]                                                │
+#   │   启动时在 allocate_kv_cache 中一次性分配（占满剩余显存），之后整个运行期间不再申请或释放        │
+#   │   "分配/释放block" 只是 BlockManager 改了几个整数，显存里的数据原地不动，直接被覆盖              │
+#   │                                                                                                  │
+#   │   按层切出视图（不拷贝，共用同一块显存）：                                                       │
+#   │     第0层  Attention.k_cache = kv_cache[0, 0]   形状 [NB, BS, Hkv, D]                            │
+#   │            Attention.v_cache = kv_cache[1, 0]                                                    │
+#   │     第1层  Attention.k_cache = kv_cache[0, 1]  ...                                               │
+#   │     ...                                                                                          │
+#   │                                                                                                  │
+#   │   写：store_kvcache（Triton kernel）按 slot_mapping 把本次新token的K/V写进对应槽位               │
+#   │   读：flash attention 按 block_tables 找到每条序列的各个block，读出全部历史K/V                   │
+#   └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+#
+# 张量并行（tp>1）时：
+#   - 只有 rank 0 有 Scheduler/BlockManager；block_table 随 Sequence 通过共享内存发给其他rank
+#   - 每个rank都有自己的 kv_cache，形状相同、block编号含义相同，但只存自己负责的那 Hkv = 总kv头数/tp 个头
+#   - 例如 tp=2：block 7 在 rank 0 上存 kv头0~3，在 rank 1 上存 kv头4~7
+#
+# 二、kv_cache 的数据格式
+#
+#   形状 [2, L, NB, BS, Hkv, D]，每一维的含义：
+#     维度     含义                         取值范围          Qwen3-0.6B（tp=1）
+#     2        K 还是 V                     0=K，1=V          2
+#     L        第几层                       0 ~ L-1           28
+#     NB       物理block编号                0 ~ NB-1          由剩余显存决定，例如2450
+#     BS       block内第几个token（偏移）   0 ~ BS-1          256
+#     Hkv      第几个kv头                   0 ~ Hkv-1         8
+#     D        头内第几个数                 0 ~ D-1           128
+#   dtype 与模型一致（如 bfloat16，每个数2字节）
+#
+#   树状展开（每一层括号代表一个维度）：
+#     kv_cache
+#     ├─ [0] K
+#     │   ├─ [第0层]
+#     │   │   ├─ [block 0]
+#     │   │   │   ├─ [偏移 0]   -> [Hkv, D]：这个槽位上的token，在第0层、所有kv头的K向量
+#     │   │   │   ├─ [偏移 1]   -> [Hkv, D]
+#     │   │   │   ├─ ...
+#     │   │   │   └─ [偏移 255] -> [Hkv, D]
+#     │   │   ├─ [block 1]  ...
+#     │   │   └─ [block NB-1]
+#     │   ├─ [第1层]  ...
+#     │   └─ [第L-1层]
+#     └─ [1] V（结构与K完全相同）
+#
+#   读一个元素的例子：kv_cache[0, 5, 3, 44, 2, :]
+#     = 第5层、物理block 3、块内偏移44、kv头2 的 K 向量（128个数）
+#     对于 block_table=[7, 3] 的序列，物理block 3 是它的第1个逻辑block，
+#     所以这是该序列第 1×256 + 44 = 300 个位置（从0数）的token的K
+#
+#   单层 k_cache [NB, BS, Hkv, D] 在显存中的排布（连续存放，可以看作 [NB×BS 个槽位, Hkv×D]）：
+#
+#     槽位slot:  0      1     ...    255 │ 256    257   ...   511 │ 512  ...
+#                └────── block 0 ───────┘  └────── block 1 ──────┘
+#     每个槽位:  [kv头0：128个数][kv头1：128个数] ... [kv头7：128个数]  = 1024个bf16 = 2KB
+#
+#     slot 只与"物理block编号 + 块内偏移"有关，与是哪条序列无关；所以写入只需要一个 slot_mapping
+#
+#   显存占用估算（Qwen3-0.6B，bf16，tp=1）：
+#     一个token、一层、K：     Hkv × D × 2字节      = 8 × 128 × 2      = 2KB
+#     一个token、所有层、K和V： 2 × L × 2KB          = 2 × 28 × 2KB     = 112KB
+#     一个block（256个token）：256 × 112KB                             = 28MB
+#
+#   kv_cache 里没有的东西：token id（只在CPU上的 Sequence/Block 里）、Q（用完即弃，不需要缓存）
+#
+# 三、一条请求的完整走查（block_size=256，prompt 300个token，无前缀缓存）
+#
+#   (1) 调度 prefill：BlockManager.allocate
+#         需要 ceil(300/256) = 2 个block，从 free_block_ids 左边取出两个空闲block（假设是 7 和 3）
+#         seq.block_table = [7, 3]
+#
+#   (2) prepare_prefill：计算每个token的写入槽位
+#         token   0 ~ 255 -> block 7 -> slot 7×256+0 ~ 7×256+255 = 1792 ~ 2047
+#         token 256 ~ 299 -> block 3 -> slot 3×256+0 ~ 3×256+43  =  768 ~  811
+#         slot_mapping = [1792, 1793, ..., 2047, 768, 769, ..., 811]（共300个）
+#
+#   (3) 模型前向，28层中的每一层：
+#         store_kvcache：本层算出的 K/V [300, Hkv, D] 按 slot_mapping 写入 k_cache/v_cache
+#           第i个token -> k_cache 展平后的第 slot_mapping[i] 行
+#         flash_attn_varlen_func：prefill 无前缀缓存时直接用本次的 k/v 计算注意力
+#
+#   (4) postprocess：采样得到第1个新token，追加到序列，len = 301
+#
+#   (5) 调度 decode：may_append
+#         301 % 256 = 45 ≠ 1，最后一个block还有空位，不需要新block
+#
+#   (6) prepare_decode：
+#         新token位置300，在第1个逻辑block（物理block 3）的偏移44
+#         slot_mapping = [3×256 + 44] = [812]
+#         context_lens = [301]，block_tables = [[7, 3]]
+#
+#   (7) 每一层：
+#         store_kvcache：把这个新token的K/V写入 slot 812
+#         flash_attn_with_kvcache：按 block_tables 读 block 7 的256个槽位 + block 3 的前45个槽位，
+#           共 context_lens = 301 个位置的K/V，与新token的Q做注意力
+#
+#   (8) 序列结束：deallocate
+#         block 3、7 的 ref_count 减到0，放回 free_block_ids；显存里的K/V不清除，
+#         已填满的 block 7 的 hash 仍在 hash_to_block_id 里，之后相同前缀的请求可以直接复用
+#====================================================================================================
+
+
 # KV cache的最小管理单元（PagedAttention中的"页"）
 # 一个block存放block_size个token在所有层的K和V，真正的显存在ModelRunner.kv_cache里，这里只记录元信息
 class Block:
 
     def __init__(self, block_id):
-        # 物理block编号，对应kv_cache张量第3维的下标
+        # 物理block编号，对应kv_cache张量第2维（从0数，即NB维）的下标，见文件开头的全局视角
         self.block_id = block_id
         # 引用计数：有多少条序列正在使用这个block
         # 前缀缓存命中时，多条序列可以共享同一个block，ref_count > 1
