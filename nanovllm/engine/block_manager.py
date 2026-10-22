@@ -11,8 +11,67 @@ from nanovllm.engine.sequence import Sequence
 #
 # 一句话总结：
 #   BlockManager 在 CPU 上"记账"（哪个block空闲、哪个被谁用、内容的hash），只处理整数编号，从不碰显存；
-#   ModelRunner.kv_cache 是 GPU 上一整块预先分配好的显存，真正存放K/V数据；
+#   ModelRunner.kv_cache 是一个预先分配在 GPU 上的大张量（torch.Tensor），真正存放K/V数据；
 #   两者之间唯一的纽带是"物理block编号"：block编号 = kv_cache 第2维（NB维）的下标。
+#
+# 零、ModelRunner.kv_cache 到底是什么？
+#
+#   答：就是一个普通的 PyTorch 张量（torch.Tensor），不是自定义的类，也不是列表或字典。
+#   它是 ModelRunner 对象的一个属性（self.kv_cache），在 ModelRunner.allocate_kv_cache 中用一行代码创建：
+#
+#     self.kv_cache = torch.empty(2, L, NB, BS, Hkv, D)
+#
+#   ModelRunner.__init__ 在这之前调用了 torch.set_default_device("cuda") 和 torch.set_default_dtype(模型dtype)，
+#   所以这行代码等价于：
+#
+#     self.kv_cache = torch.empty(2, L, NB, BS, Hkv, D, device="cuda", dtype=torch.bfloat16)
+#
+#   即：在GPU上申请一块能放下 2×L×NB×BS×Hkv×D 个bf16数的连续显存，并把它当作一个6维数组来使用。
+#   torch.empty 只申请空间、不初始化，里面一开始是随机的旧数据；这没关系，
+#   因为每个位置都是先由 store_kvcache 写入、之后才会被注意力读取（context_lens 保证不会读到未写入的位置）。
+#
+#   它的各项属性（Qwen3-0.6B，tp=1，假设 NB=2450）：
+#
+#     属性                 值                                  说明
+#     ──────────────────────────────────────────────────────────────────────────────────────────────
+#     type(kv_cache)       torch.Tensor                        普通张量
+#     kv_cache.device      cuda:0                              在GPU显存上（tp>1时第i个rank在cuda:i）
+#     kv_cache.dtype       torch.bfloat16                      与模型权重一致，每个数2字节
+#     kv_cache.shape       [2, 28, 2450, 256, 8, 128]          6个维度的含义见下面"二"
+#     kv_cache.numel()     约 360 亿个数                       2×28×2450×256×8×128
+#     占用显存             约 67GB                             = NB × 每个block 28MB
+#     is_contiguous()      True                                一整块连续显存，没有空洞
+#     requires_grad        False                               只做推理，不需要梯度
+#
+#   谁持有它、谁读写它：
+#
+#     ModelRunner.kv_cache                 原始张量，每个rank进程各一个
+#       │
+#       │ allocate_kv_cache 中切片：module.k_cache = self.kv_cache[0, layer_id]
+#       ▼
+#     第i层 Attention.k_cache / v_cache    也是张量，但只是"视图"：不复制数据，指向原张量中属于第i层的那一段显存
+#       │
+#       ├─ 写：store_kvcache（Triton kernel）在GPU上直接按 slot_mapping 写入
+#       └─ 读：flash_attn_varlen_func / flash_attn_with_kvcache 在GPU上按 block_tables 读取
+#
+#     整个运行过程中，没有任何Python代码逐个读写它的元素，CPU也从不读取其中的数据；
+#     BlockManager 和 block_table 只是决定"写到哪个block、从哪些block读"的整数编号
+#
+#   "视图"的小例子（为什么改 k_cache 就等于改 kv_cache）：
+#
+#     kv = torch.zeros(2, 3, 4)     # 一块内存，24个数
+#     k1 = kv[0, 1]                 # 形状[4]，指向 kv 中下标为(0, 1, 0~3)的那4个数，不复制
+#     k1[2] = 5.0                   # 通过视图写入
+#     print(kv[0, 1, 2])            # tensor(5.)，原张量也变了，因为它们是同一块内存
+#
+#   生命周期：
+#     启动时（warmup 测出峰值显存之后）创建一次 ──> 一直存在、大小不变、不会挪到CPU ──> 进程退出时随之释放
+#     "分配/释放block"不会申请或清空显存，只是 BlockManager 改了几个整数；被释放的block里的旧数据之后会被直接覆盖
+#
+#   为什么用一个大张量，而不是每个block、每条序列各建一个张量？
+#     1. 只申请一次显存，没有反复申请/释放的开销，也没有显存碎片
+#     2. 地址好算：第slot个槽位就在 slot × (Hkv×D) 的位置，Triton kernel 一次寻址即可
+#     3. flash attention 的分页接口要求传入一个 [NB, BS, Hkv, D] 的cache张量 + block_table，正好对应每层的视图
 #
 # 一、整体结构（以 tensor_parallel_size=1 为例）
 #

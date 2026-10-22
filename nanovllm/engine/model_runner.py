@@ -248,6 +248,8 @@ class ModelRunner:
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         # 一整块连续张量存放所有层的KV
+        # kv_cache 就是一个普通的 torch.Tensor（默认device已设为cuda，所以直接在GPU上），
+        # 它是什么、谁读写它、为什么只用一个大张量，详见 block_manager.py 开头全局视角的"零"
         # kv_cache: [2, L, NB, BS, Hkv, D]
         #   第0维：0为K，1为V
         #   第1维：层号
