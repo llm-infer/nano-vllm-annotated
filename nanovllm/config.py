@@ -3,6 +3,49 @@ from dataclasses import dataclass
 from transformers import AutoConfig
 
 
+#====================================================================================================
+# 全局视角：Config 在引擎中的流转，以及每个字段被谁使用
+#====================================================================================================
+#
+# 创建与填充的时间线（同一个Config对象被各组件共享，后面的修改前面的组件也能看到）：
+#
+#   LLM(path, **kwargs)
+#     │ LLMEngine.__init__：从kwargs中挑出Config的字段，创建 Config
+#     │   __post_init__：校验参数，读取 hf_config，修正 max_model_len
+#     ▼
+#   ModelRunner(config, rank, ...)
+#     │ allocate_kv_cache：根据剩余显存算出并写入 config.num_kvcache_blocks（原来是-1）
+#     ▼
+#   LLMEngine：从tokenizer读取并写入 config.eos（原来是-1）
+#     ▼
+#   Scheduler(config)：此时 num_kvcache_blocks 和 eos 都已就绪，创建 BlockManager
+#
+#   注意：张量并行时，子进程（rank 1~N-1）拿到的是Config经过pickle复制的副本，
+#   rank 0 上之后的修改（如eos）不会同步过去；子进程会在自己的 allocate_kv_cache 中各自算出 num_kvcache_blocks
+#
+# 字段 -> 使用者：
+#
+#   字段                        谁使用                                 用来做什么
+#   ────────────────────────────────────────────────────────────────────────────────────────────────
+#   model                       load_model、AutoTokenizer              读取权重和分词器
+#   max_num_batched_tokens      Scheduler                              每步prefill的token预算
+#                               ModelRunner.warmup_model               决定预热batch的规模
+#   max_num_seqs                Scheduler                              每步最多调度多少条序列
+#                               ModelRunner.capture_cudagraph          最大捕获batch（不超过512）
+#   max_model_len               ModelRunner.warmup_model               预热序列长度
+#                               ModelRunner.capture_cudagraph          block_tables缓冲区的列数
+#   gpu_memory_utilization      ModelRunner.allocate_kv_cache          计算KV cache可用显存
+#   tensor_parallel_size        LLMEngine                              启动几个子进程
+#                               ModelRunner                            进程组大小、kv头切分
+#   enforce_eager               ModelRunner                            是否捕获/使用CUDA Graph
+#   hf_config                   ModelRunner、Qwen3ForCausalLM          构建模型、计算block字节数
+#   eos                         Scheduler.postprocess                  判断序列是否结束
+#   kvcache_block_size          Sequence、BlockManager                 按block切分token、分配block
+#                               ModelRunner                            计算slot、kv_cache形状
+#   num_kvcache_blocks          BlockManager                           物理block总数
+#====================================================================================================
+
+
 # dataclass：根据类里的字段声明，自动帮你生成样板方法，不用再手写 __init__、__repr__、__eq__
 # slots=True：
 #   作用：为每个字段预留一个固定位置，而不是用__dict__存放字段；

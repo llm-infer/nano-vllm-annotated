@@ -40,6 +40,22 @@ def apply_rotary_emb(
 
 
 # 旋转位置编码（RoPE），预先计算好所有位置的cos/sin，前向时按位置查表
+#
+# cos_sin_cache 的结构与查表过程（D=128，每个头64对维度，f_i = inv_freq[i]）：
+#
+#   cos_sin_cache [max_pos, 1, 128]（中间的1省略不画）
+#               ├────── 前64个：cos ──────┤         ├────── 后64个：sin ──────┤
+#     位置0     cos(0·f0)  ...  cos(0·f63)          sin(0·f0)  ...  sin(0·f63)
+#     位置1     cos(1·f0)  ...  cos(1·f63)          sin(1·f0)  ...  sin(1·f63)
+#     ...
+#     位置m     cos(m·f0)  ...  cos(m·f63)          sin(m·f0)  ...  sin(m·f63)
+#
+#   forward：
+#     positions [N] ──查表──> cos_sin [N, 1, 128] ──chunk──> cos [N, 1, 64]、sin [N, 1, 64]
+#     q [N, Hq, 128] ──chunk──> x1 = 前64维、x2 = 后64维
+#                   ──旋转──> y1 = x1·cos - x2·sin，y2 = x2·cos + x1·sin   （cos/sin在Hq个头上广播）
+#                   ──cat───> [N, Hq, 128]
+#     k 同理（Hkv个头）；v 不做旋转
 class RotaryEmbedding(nn.Module):
 
     def __init__(

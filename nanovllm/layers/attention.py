@@ -122,6 +122,29 @@ class Attention(nn.Module):
         # 占位的空张量，ModelRunner.allocate_kv_cache会替换为本层的cache视图 [NB, BS, Hkv, D]
         self.k_cache = self.v_cache = torch.tensor([])
 
+    # forward 的三种情况（每一层每次前向都会走其中一种）：
+    #
+    #     情况                     本次k/v写入cache？      K/V从哪里读                 调用的函数
+    #     ─────────────────────────────────────────────────────────────────────────────────────────────────────
+    #     warmup（cache未分配）    跳过                    本次的 k/v [N, Hkv, D]      flash_attn_varlen_func
+    #     prefill，无缓存前缀      写入                    本次的 k/v [N, Hkv, D]      flash_attn_varlen_func
+    #     prefill，有缓存前缀      写入                    k_cache + block_tables      flash_attn_varlen_func
+    #                                                      （前缀的K/V只在cache里）      (传 block_table=...)
+    #     decode                   写入                    k_cache + block_tables      flash_attn_with_kvcache
+    #
+    # "有缓存前缀"包括两种来源：前缀缓存命中（num_cached_tokens > 0），以及chunked prefill的第2个及以后的块
+    # 判断方法：prepare_prefill 中 cu_seqlens_k[-1] > cu_seqlens_q[-1] 时才会设置 block_tables
+    #
+    # 按 block_tables 从分页的cache中读K（例：block_tables[i] = [7, 3]，context_lens[i] = 301，BS=256）：
+    #
+    #   k_cache [NB, BS, Hkv, D]： ... │ block 3 │ ... │ block 7 │ ...   物理上不连续，顺序也可以颠倒
+    #                                      │               │
+    #              ┌───────────────────────┼───────────────┘
+    #              ▼                       ▼
+    #   逻辑顺序： block 7 的槽位 0~255  + block 3 的槽位 0~44
+    #              = 这条序列的位置 0~255  = 位置 256~300        共 301 个K，与这条序列的q做注意力
+    #   V 按同样方式读取；block 3 中槽位 45~255 还没写入有效数据，因为 context_lens=301 所以不会被读到
+    #
     # 输入：q [N, Hq, D]，k/v [N, Hkv, D]
     # 输出：o [N, Hq, D]
     # Hq > Hkv时为GQA（每 Hq/Hkv 个q头共享一组kv头），flash attention内部自动处理

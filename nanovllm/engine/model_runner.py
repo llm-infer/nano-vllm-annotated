@@ -453,6 +453,36 @@ class ModelRunner:
             # lm_head不在graph内（输出到rank 0需要gather）
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    # 一次 run() 的完整数据流（例：prefill，2条序列A、B，本次分别计算3个、2个token -> B=2，N=5）：
+    #
+    #   seqs = [A, B]                                    CPU上的Python对象（Sequence）
+    #      │
+    #      │ prepare_prefill（decode时为prepare_decode）：Python列表 -> 张量，.cuda()拷到GPU
+    #      ├──> input_ids [5]、positions [5]             作为参数传给模型
+    #      ├──> cu_seqlens_q/k [3]、slot_mapping [5]、   set_context 放进全局 _CONTEXT，
+    #      │    block_tables [2, M]（有前缀时）          每一层 Attention 用 get_context() 读取
+    #      │
+    #      │ prepare_sample（只在rank 0）
+    #      ├──> temperatures [2]
+    #      ▼
+    #   run_model：
+    #      prefill / enforce_eager / bs>512  ──> self.model(input_ids, positions)，逐个发射kernel
+    #      decode                            ──> 拷进CUDA Graph的静态缓冲区，graph.replay()
+    #      │
+    #      ├──> hidden_states [5, H]                     28层Transformer的输出，每个token一行
+    #      │      │ compute_logits（lm_head）：prefill只取每条序列最后一个token；tp>1时gather到rank 0
+    #      │      ▼
+    #      └──> logits [2, V]                            每条序列在整个词表上的打分
+    #      │
+    #      ▼
+    #   sampler(logits, temperatures)  ──> token_ids [2]（GPU张量）
+    #      │ .tolist()：拷回CPU，并等待GPU全部算完
+    #      ▼
+    #   [15, 8]（Python列表）──> 返回给 LLMEngine.step ──> scheduler.postprocess 追加到各序列
+    #
+    #   最后 reset_context() 清空全局元数据，避免下一步误用
+    #   其他rank执行同样的run()（同样的前向，参与all_reduce/gather），但不采样，返回None
+    #
     # 执行一次step：准备输入 -> 前向 -> 采样，返回每条序列新生成的token id（长度为B的list，仅rank 0）
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
