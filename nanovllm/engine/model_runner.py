@@ -285,7 +285,59 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    # 构造prefill的模型输入
+    # 构造prefill的模型输入：把一批序列"本次要算的那段token"整理成模型和注意力需要的张量
+    #
+    # 完整流程（例：BS=4，一个batch里有A、B两条序列）：
+    #
+    #   1) 输入：seqs（CPU上的Sequence对象，调度器已经分好block、定好本次算多少个）
+    #        A：a0 ~ a5（6个token）  num_cached_tokens=0  num_scheduled_tokens=6  block_table=[4, 1]
+    #        B：b0 ~ b6（7个token）  num_cached_tokens=4  num_scheduled_tokens=3  block_table=[2, 5]
+    #           （B的 b0~b3 命中前缀缓存，KV已经在 block 2 里，本次只算 b4~b6）
+    #                │
+    #                ▼
+    #   2) 每条序列确定本次计算区间 [start, end) = [num_cached_tokens, num_cached_tokens + num_scheduled_tokens)
+    #        A：[0, 6)        B：[4, 7)
+    #                │
+    #                ▼
+    #   3) 逐条序列生成各字段，再首尾拼接：
+    #
+    #     字段           A 的部分                  B 的部分            拼接后
+    #     ────────────────────────────────────────────────────────────────────────────────────────────────
+    #     input_ids      a0 a1 a2 a3 a4 a5         b4 b5 b6            [a0 a1 a2 a3 a4 a5 b4 b5 b6]  N=9
+    #     positions      0  1  2  3  4  5          4  5  6             [0 1 2 3 4 5 4 5 6]
+    #     q长度          6（本次算的）             3                   cu_seqlens_q = [0, 6, 9]
+    #     k长度          6（= end）                7（含缓存的4个）    cu_seqlens_k = [0, 6, 13]
+    #     slot_mapping   16 17 18 19 4 5           20 21 22            [16 17 18 19 4 5 20 21 22]
+    #     max_seqlen                                                   max_seqlen_q = 6，max_seqlen_k = 7
+    #
+    #        slot_mapping 的计算（slot = 物理block编号 × BS + 块内偏移）：
+    #          A：token 0~3 在逻辑block0 -> 物理block 4 -> slot 4×4+0 ~ 4×4+3 = 16 ~ 19
+    #             token 4~5 在逻辑block1 -> 物理block 1 -> slot 1×4+0 ~ 1×4+1 =  4 ~  5
+    #          B：token 4~6 在逻辑block1 -> 物理block 5 -> slot 5×4+0 ~ 5×4+2 = 20 ~ 22
+    #          （B的 token 0~3 已在缓存里，不算、也不写）
+    #                │
+    #                ▼
+    #   4) 判断是否需要 block_tables：cu_seqlens_k[-1]=13 > cu_seqlens_q[-1]=9，说明有序列带缓存前缀
+    #        -> block_tables = [[4, 1], [2, 5]]（没有缓存前缀时为 None）
+    #                │
+    #                ▼
+    #   5) Python列表 -> torch.tensor(pin_memory=True).cuda(non_blocking=True)，全部拷到GPU
+    #                │
+    #                ├──> return input_ids, positions          作为模型的输入参数
+    #                └──> set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+    #                                 slot_mapping, None, block_tables)   放进全局上下文
+    #                │
+    #                ▼
+    #   6) 模型前向中这些字段的去向：
+    #        input_ids     -> embedding 查表
+    #        positions     -> RoPE，按位置旋转 q、k
+    #        slot_mapping  -> 每层 store_kvcache：把这9个token的K/V写进 slot 16~19、4~5、20~22
+    #        cu_seqlens_q/k + block_tables -> 每层 flash_attn_varlen_func：
+    #                         A 的6个q 看 A 的6个k
+    #                         B 的3个q（b4~b6）看 B 的7个k（b0~b3 从 block 2 读，b4~b6 刚写入 block 5）
+    #        cu_seqlens_q  -> lm_head 只取每条序列最后一个token：下标 [6-1, 9-1] = [5, 8]，即 a5、b6
+    #
+    # 补充：为什么拼接成一维而不是padding
     # 多条序列的token直接拼接成一维（不做padding），用cu_seqlens记录每条序列的边界，
     # 供flash_attn_varlen_func使用，没有padding浪费
     #
@@ -368,7 +420,50 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
-    # 构造decode的模型输入：每条序列只输入最后一个token，N = B
+    # 构造decode的模型输入：每条序列只输入上一步生成的那1个token（N = B）
+    #
+    # 完整流程（例：BS=4，接着上面的A、B，各自又生成了几个token）：
+    #
+    #   1) 输入：seqs（调度器已执行 may_append：需要新block的序列已经分到了block）
+    #        A：a0 ~ a6（len=7）  last_token=a6  block_table=[4, 1]
+    #        B：b0 ~ b8（len=9）  last_token=b8  block_table=[2, 5, 3]
+    #           （b8 是第3个逻辑block的第1个token，may_append 刚给 B 分配了 block 3）
+    #                │
+    #                ▼
+    #   2) 每条序列生成一项，再拼成长度为B的列表：
+    #
+    #     字段           A                         B                       拼接后
+    #     ──────────────────────────────────────────────────────────────────────────────────────────────
+    #     input_ids      last_token = a6           b8                      [a6, b8]
+    #     positions      len - 1 = 6               8                       [6, 8]
+    #     context_lens   len = 7                   9                       [7, 9]
+    #     slot_mapping   1×4 + 3 - 1 = 6           3×4 + 1 - 1 = 12        [6, 12]
+    #     block_tables   [4, 1]                    [2, 5, 3]               [[4, 1, -1],
+    #                                                                       [2, 5, 3]]  不够长的补-1
+    #
+    #        slot_mapping = block_table[-1] × BS + last_block_num_tokens - 1（新token写在最后一个block的最后一个有效位置）：
+    #          A：最后一个block是1，里面有 7 - 4 = 3 个token，a6 是第3个 -> 偏移2 -> slot = 1×4 + 2 = 6
+    #          B：最后一个block是3，里面有 9 - 8 = 1 个token，b8 是第1个 -> 偏移0 -> slot = 3×4 + 0 = 12
+    #                │
+    #                ▼
+    #   3) Python列表 -> GPU张量（同prefill）
+    #                │
+    #                ├──> return input_ids, positions
+    #                └──> set_context(False, slot_mapping=..., context_lens=..., block_tables=...)
+    #                     （decode不需要cu_seqlens：每条序列正好1个q，天然对齐）
+    #                │
+    #                ▼
+    #   4) 模型前向中这些字段的去向（若走CUDA Graph，会先拷进静态缓冲区，padding部分 slot=-1、context_lens=0）：
+    #        input_ids、positions -> embedding、RoPE
+    #        slot_mapping         -> 每层 store_kvcache：a6 的K/V写入 slot 6，b8 的写入 slot 12
+    #        block_tables + context_lens -> 每层 flash_attn_with_kvcache：
+    #                         A：读 block 4 的4个 + block 1 的前3个 = 7个K/V（a0~a6）
+    #                         B：读 block 2 的4个 + block 5 的4个 + block 3 的前1个 = 9个K/V（b0~b8）
+    #        lm_head              -> 每条序列本来就只有1个token，直接得到 logits [2, V]
+    #
+    # 和prefill的区别：
+    #   prefill：每条序列输入一段token（长度不一），用 cu_seqlens 标边界，可能没有block_tables
+    #   decode ：每条序列只输入1个token，不需要 cu_seqlens，一定有 block_tables（历史K/V全在cache里）
     # 返回：input_ids [B]，positions [B]
     def prepare_decode(self, seqs: list[Sequence]):
         # 每条序列的最后一个token，[B]
